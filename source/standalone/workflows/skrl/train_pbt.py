@@ -8,12 +8,16 @@ Script to train RL agent with skrl.
 
 Visit the skrl documentation (https://skrl.readthedocs.io) to see the examples structured in
 a more user-friendly way.
-"""
 
-"""Launch Isaac Sim Simulator first."""
+Launch Isaac Sim Simulator first.
+"""
 
 import argparse
 import sys
+import os
+import random
+from datetime import datetime
+from packaging import version
 
 from omni.isaac.lab.app import AppLauncher
 
@@ -64,6 +68,9 @@ parser.add_argument(
     choices=["PPO", "IPPO", "MAPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
+parser.add_argument(
+    "--num_agents", type=int, default=1, help="Define the number of agents for the PBT"
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -82,13 +89,9 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import gymnasium as gym
-import os
-import random
-from datetime import datetime
 
+import gymnasium as gym
 import skrl
-from packaging import version
 
 # check for minimum supported skrl version
 SKRL_VERSION = "1.3.0"
@@ -118,47 +121,22 @@ import omni.isaac.lab_tasks  # noqa: F401
 from omni.isaac.lab_tasks.utils.hydra import hydra_task_config
 from omni.isaac.lab_tasks.utils.wrappers.skrl import SkrlVecEnvWrapper
 
-# config shortcuts
+
+# This allows you to set the algorithm via the cli
 algorithm = args_cli.algorithm.lower()
-agent_cfg_entry_point = (
-    "skrl_cfg_entry_point"
-    if algorithm in ["ppo"]
-    else f"skrl_{algorithm}_cfg_entry_point"
-)
+# Hard coding this as each environment for bz will either be single or multiple
+# therefore we can just set the entry point to be this string
+AGENT_CFG_ENTRY_POINT = "skrl_cfg_entry_point"
 
 
-@hydra_task_config(args_cli.task, agent_cfg_entry_point)
-def main(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict
-):
-    """Train with skrl agent."""
-    # override configurations with non-hydra CLI arguments
-    env_cfg.scene.num_envs = (
-        args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    )
-    env_cfg.sim.device = (
-        args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    )
-
-    # multi-gpu training config
-    if args_cli.distributed:
-        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
-    # max iterations for training
-    if args_cli.max_iterations:
-        agent_cfg["trainer"]["timesteps"] = (
-            args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
-        )
-    agent_cfg["trainer"]["close_environment_at_exit"] = False
-    # configure the ML framework into the global skrl variable
-    if args_cli.ml_framework.startswith("jax"):
-        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
-
-    # randomly sample a seed if seed = -1
-    if args_cli.seed == -1:
-        args_cli.seed = random.randint(0, 10000)
-
+# This function is for the population based training to run so it creates
+# independent agents
+def train_skrl():
     # set the agent and environment seed from command line
     # note: certain randomization occur in the environment initialization so we set the seed here
+
+    # TODO: FIX SEED HERE
+    # TODO: DO YOU GET INDEX FROM THE PBT???? IF NOT MIGHT NOT WORK
     agent_cfg["seed"] = (
         args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
     )
@@ -191,7 +169,9 @@ def main(
 
     # create isaac environment
     env = gym.make(
-        args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None
+        args_cli.task,
+        cfg=env_cfg,
+        render_mode="rgb_array" if args_cli.video else None,
     )
     # wrap for video recording
     if args_cli.video:
@@ -210,9 +190,8 @@ def main(
         env = multi_agent_to_single_agent(env)
 
     # wrap around environment for skrl
-    env = SkrlVecEnvWrapper(
-        env, ml_framework=args_cli.ml_framework
-    )  # same as: `wrap_env(env, wrapper="auto")`
+    # same as: `wrap_env(env, wrapper="auto")`
+    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
@@ -223,6 +202,60 @@ def main(
 
     # close the simulator
     env.close()
+
+
+# The task is actually the name of the environment like "BZ-Drone-Target-Hover-Direct-v0"
+# and AGENT_CFG_ENTRY_POINT lets you load in the appropriate configuration file
+# this decorator parses the environment and the agent and passes it into main
+@hydra_task_config(args_cli.task, AGENT_CFG_ENTRY_POINT)
+def main(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict
+):
+    """Train with skrl agent."""
+
+    # =================================================================
+    # MARK: Overriding configurations with non-hydra CLI arguments
+    # =================================================================
+
+    # Overrides the number of environments being used
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = args_cli.num_envs
+
+    # Sets the device to either the cpu or gpu
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+
+    # multi-gpu training config
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+
+    # max iterations for training
+    if args_cli.max_iterations:
+        agent_cfg["trainer"]["timesteps"] = (
+            args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
+        )
+
+    # TODO: Whether to close the environment when the trianing ends??
+    agent_cfg["trainer"]["close_environment_at_exit"] = False
+
+    # configure the ML framework into the global skrl variable
+    if args_cli.ml_framework.startswith("jax"):
+        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
+
+    # randomly sample a seed if seed = -1
+    if args_cli.seed == -1:
+        args_cli.seed = random.randint(0, 10000)
+
+    if args_cli.seed is not None:
+        agent_cfg["seed"] = args_cli.seed
+    # =================================================================
+
+    # Create a function to train the system
+
+    # TODO: Fill in the PBT part here
+    pbt = PopulationBasedTraining()
+
+    # TODO: Deal with the best agent, ideally copy it to its own folder and mark which one it is
 
 
 if __name__ == "__main__":
